@@ -94,13 +94,21 @@ rm ~/.hermes/tui-widgets/opencode-balance.mjs
 
 - 百分比取 `zen/go/v1/usage`（服务端权威值）；
 - 美元按「当前模型月限 × 窗口比例」换算，行的格式为 `剩 $16/$20`；
-- 卡片标题显示当前模型（`⚡ Go · deepseek-v4.1-flash`）。当前模型的判定顺序：
-  1. `HERMES_INFERENCE_MODEL` / `HERMES_MODEL` 环境变量（临时覆盖，也能用来预览别的模型额度）
-  2. `~/.hermes/state.db` 里最近活跃会话的 model —— TUI 的 `/model` 切换是**会话级**的，只写这里，
-     不写 config.yaml 也不写进程 env（见 `tui_gateway/model_switch.py`），所以必须读库才能跟上
-  3. `~/.hermes/config.yaml` 的 `model.default`（老版本 / 无 state.db 时）
-- 模型列表每 60 秒随刷新重读一次，所以 `/model` 切换后最多 1 分钟就跟随；
+- 卡片标题显示当前模型与**来源标记**（`⚡ Go · deepseek-v4.1-flash [db]`）。判定顺序：
+  0. `/ocbal model=<id>` 手动锁定（`[lock]`，最可靠；`/ocbal model=auto` 解除）——多窗口时用这个
+  1. `HERMES_INFERENCE_MODEL` / `HERMES_MODEL` 环境变量（`[env]`，也能用来预览别的模型额度）
+  2. `~/.hermes/state.db` 里**最近活跃会话**的 model（`[db]`）—— TUI 的 `/model` 切换是会话级，
+     不写 config.yaml 也不写进程 env（见 `tui_gateway/model_switch.py`），只能读库
+  3. `~/.hermes/config.yaml` 的 `model.default`（`[config]`，老版本 / 无 state.db 时）
+- 模型每 **5 秒**检测一次（只读 state.db，约 7ms），额度接口仍 60 秒一拉；模型变化立刻重渲染。
 - 模型月限来自官网表格，抓不到时用内置兜底表；两者都不命中（未知模型）则回退成服务端池口径的 `剩 $x.xx`。
+
+**为什么做不到「秒跟随」**（两条都是 Hermes 侧的限制，不是挂件能绕过的）：
+
+- widget SDK 的 `render(ctx)` 只给 `cols / rows / state / t`，**拿不到本窗口的 session id**，
+  所以只能靠「最近活跃会话」猜当前模型——同时开多个窗口、且在别的窗口切模型时会读错；
+- `/model` 在流式输出期间是 **pending** 的（下一轮 turn 开始才应用并写库），此时连 Hermes 自己的
+  footer 都还显示旧模型，挂件自然也读不到新值。
 
 **精度说明**：`zen/go/v1/usage` 的 percent 是**账户级综合百分比**（Go 把各模型额度按扣费归一成一个池），
 不是按模型分开计的两个数。所以美元数字是「按当前模型月限换算的等价额度」——只用一个模型时准确，

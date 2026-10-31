@@ -2,7 +2,7 @@
 // 用法: node scripts/preview.mjs [widget.mjs]
 //   HERMES_MODEL=glm-5.3 node scripts/preview.mjs   # 预览别的模型额度
 // 需要能读 ~/.hermes/.env 的 key（真实请求 OpenCode 接口）。
-const file = process.argv[2] || new URL('../opencode-balance.mjs', import.meta.url).pathname
+const file = process.argv.slice(2).find((a) => !a.startsWith('--')) || new URL('../opencode-balance.mjs', import.meta.url).pathname
 
 // ── 迷你 React ──
 let slots = []
@@ -131,10 +131,14 @@ if (!captured) {
   process.exit(1)
 }
 
+// 可选：--model=<id> 预览手动锁定某个模型的额度
+const arg = process.argv.find((a) => a.startsWith('--model=')) || ''
+const state = typeof captured.init === 'function' ? captured.init(arg.replace('--model=', 'model=')) : undefined
+
 const draw = () => {
   idx = 0
 
-  return lines(captured.render({ t: THEME }))
+  return lines(captured.render({ state, t: THEME }))
 }
 
 let out = draw()

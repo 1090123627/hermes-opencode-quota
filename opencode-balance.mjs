@@ -28,6 +28,7 @@ export default function register(sdk) {
   const { Box, React, ShimmerRows, Text, defineWidgetApp, h, sparkline } = sdk
 
   const REFRESH_MS = 60_000
+  const MODEL_MS = 5_000 // 模型检测（只读 state.db，约 7ms）：切模型后最多 5s 跟上
   const TICK_MS = 15_000
   const TIMEOUT_MS = 10_000
   const HIST_MAX = 40
@@ -321,11 +322,12 @@ export default function register(sdk) {
   }
 
   async function readModel() {
-    if (modelMem && Date.now() - modelMem.at < REFRESH_MS) return modelMem
+    if (modelMem && Date.now() - modelMem.at < MODEL_MS) return modelMem
 
     const env = typeof process !== 'undefined' && process.env ? process.env : {}
     let model = String(env.HERMES_INFERENCE_MODEL || env.HERMES_MODEL || '').trim()
     let provider = ''
+    let source = model ? 'env' : ''
 
     const io = await nodeEnv()
 
@@ -335,6 +337,7 @@ export default function register(sdk) {
       if (live) {
         model = live.model
         provider = live.provider
+        source = 'db'
       }
     }
 
@@ -352,12 +355,14 @@ export default function register(sdk) {
 
           if (p) provider = p[1].trim()
         }
+
+        if (model) source = 'config'
       } catch {
         /* 读不到就当未知模型：回落到服务端池口径 */
       }
     }
 
-    modelMem = { at: Date.now(), model, provider }
+    modelMem = { at: Date.now(), model, provider, source }
 
     return modelMem
   }
@@ -481,7 +486,7 @@ export default function register(sdk) {
   }
 
   // ── 主面板 ──────────────────────────────────────────────────────
-  function Panel({ t }) {
+  function Panel({ lock, t }) {
     const [snap, setSnap] = React.useState(null)
     const [hist, setHist] = React.useState([])
     const [err, setErr] = React.useState(null)
@@ -534,6 +539,30 @@ export default function register(sdk) {
       }
     }, [])
 
+    // 模型单独按 15s 轮询：/model 切换后不必等 60s 的额度刷新
+    React.useEffect(() => {
+      let alive = true
+
+      const run = async () => {
+        const mine = await readModel()
+
+        if (!alive) return
+
+        setSnap((prev) =>
+          prev && (prev.mine.model !== mine.model || prev.mine.source !== mine.source)
+            ? { ...prev, mine }
+            : prev
+        )
+      }
+
+      const timer = setInterval(run, MODEL_MS)
+
+      return () => {
+        alive = false
+        clearInterval(timer)
+      }
+    }, [])
+
     // ── 读取中 ──
     if (!snap && !err) {
       return h(
@@ -564,13 +593,16 @@ export default function register(sdk) {
       )
     }
 
-    const { go, limits, mine, usage, zen, at } = snap
+    const { go, limits, mine: auto, usage, zen, at } = snap
     const meters = go && go.access && go.access.meters ? go.access.meters : null
     const u = usage && usage.usage ? usage.usage : null
 
     // Go 现在是「按模型计量」：provider 是 opencode-go 时用当前模型的月限换算美元
-    const onGo = !mine.provider || mine.provider.startsWith('opencode-go')
-    const modelCap = onGo && mine.model ? capOf(limits, mine.model) : null
+    // 手动锁定（/ocbal model=xxx）优先：自动检测只能猜「最近活跃会话」，
+    // 多窗口时可能不是当前这个窗口的模型
+    const mine = lock ? { model: lock, provider: '', source: 'lock' } : auto
+    const onGo = lock ? true : !mine.provider || mine.provider.startsWith('opencode-go')
+    const modelCap = mine.model ? (onGo ? capOf(limits, mine.model) : null) : null
     const rows = []
 
     for (const [label, id, m, fb] of [
@@ -610,7 +642,9 @@ export default function register(sdk) {
     const dotColor = stale ? t.color.error : Date.now() - at > 180_000 ? t.color.statusWarn : t.color.statusGood
 
     // 标题带模型名：额度是按「这个模型的月限」换算的，必须让用户看见是哪个模型
-    const title = modelCap ? ` ⚡ Go · ${clip(mine.model, 30)} ` : TITLE
+    const title = modelCap
+      ? ` ⚡ Go · ${clip(mine.model, 24)}${mine.source ? ` [${mine.source}]` : ''} `
+      : TITLE
     const mode = stale
       ? `上次成功 ${ago(at)}`
       : zen
@@ -720,16 +754,20 @@ export default function register(sdk) {
     id: 'ocbal',
     mode: 'ambient',
 
-    init() {
-      return { ok: true }
+    init(arg) {
+      // 用法: /ocbal model=glm-5.3-flash  （model=auto 解除锁定）
+      const hit = /(?:^|\s)model=(\S+)/.exec(String(arg || ''))
+      const lock = hit && hit[1] !== 'auto' ? hit[1] : ''
+
+      return { lock }
     },
 
     reduce(state, { ch, key }) {
       return key.escape || ch === 'q' ? null : state
     },
 
-    render({ t }) {
-      return h(Panel, { t })
+    render({ state, t }) {
+      return h(Panel, { lock: state && state.lock ? state.lock : '', t })
     }
   })
 
