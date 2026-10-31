@@ -1,6 +1,14 @@
 /**
  * OpenCode 额度挂件 — Hermes TUI 常驻面板（ambient · 停靠在状态栏上方）
  *
+ * v3 变更：Go 订阅已改为「按模型计量月度额度」（官网 2026-10 起，
+ * 每个模型的月度额度不同，5h = 月限 20%、周 = 月限 50%、月 = 100%）。
+ * console/api/go/status 里的 meters 美元仍是旧的 $60 账户池口径，
+ * 直接显示会低估实际可用额度，所以：
+ *   · 百分比一律以 zen/go/v1/usage（服务端权威）为准，不再由 meters 现算；
+ *   · 美元剩余/上限按「当前模型月限」换算：月限来自 opencode.ai/go 表格
+ *     （6h 缓存到 ~/.hermes/cache/ocbal-go-limits.json，抓不到用内置兜底表）。
+ *
  * v2 视觉：圆角卡片 + 边框内嵌标题、细线进度条（━/┄ + 半步收尾）、
  * 分段配色（statusGood → statusWarn → statusBad → statusCritical）、
  * 会话内 5h 用量走势图（放在分隔线上）、右上角新鲜度指示灯。
@@ -8,8 +16,9 @@
  *
  * 数据源（OPENCODE_ZEN_API_KEY / OPENCODE_GO_API_KEY 的 Bearer key）:
  *   GET https://opencode.ai/console/api/billing/status  → Zen 预付钱包余额
- *   GET https://opencode.ai/console/api/go/status       → Go 订阅 5h / 周 / 月 三窗口
- *   GET https://opencode.ai/zen/go/v1/usage             → 备用：三窗口百分比
+ *   GET https://opencode.ai/console/api/go/status       → Go 订阅窗口起止（百分比备用）
+ *   GET https://opencode.ai/zen/go/v1/usage             → 三窗口百分比（权威）
+ *   GET https://opencode.ai/go                          → 各模型 Go/Plus 月度额度表
  *
  * 安装: 保存为 ~/.hermes/tui-widgets/opencode-balance.mjs → /widgets-reload
  * 开关: /ocbal （同一命令再按一次收起）
@@ -25,8 +34,8 @@ export default function register(sdk) {
 
   const WIDTH = 52 // 卡片总宽（含边框与内边距）
   const INNER = WIDTH - 6 // 可用内容宽 = 宽度 - 边框(1+1) - paddingX(2+2)
-  const BAR_W = 13
-  const REMAIN_W = 10
+  const BAR_W = 11
+  const REMAIN_W = 14
   const ETA_W = 8
   const TITLE = ' ⚡ OpenCode 额度 '
 
@@ -89,6 +98,15 @@ export default function register(sdk) {
     return `$${Math.abs(v) < 100 ? v.toFixed(2) : Math.round(v)}`
   }
 
+  /** 额度美元（已是美元单位）：$10 以上取整、小额两位 —— 最长 $0.00（5 列），配合 REMAIN_W=14 不溢出 */
+  const money = (v) => {
+    const n = Number(v)
+
+    if (!Number.isFinite(n)) return '—'
+
+    return n >= 10 ? `$${Math.round(n)}` : `$${n.toFixed(2)}`
+  }
+
   const pctOf = (used, limit) => {
     const u = Number(used)
     const l = Number(limit)
@@ -109,7 +127,7 @@ export default function register(sdk) {
 
     if (m < 1) return '<1m'
     if (m < 60) return `${m}m`
-    if (m < 1440) return `${Math.floor(m / 60)}h${lpad(m % 60, 2)}m`
+    if (m < 1440) return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
 
     return `${Math.floor(m / 1440)}天`
   }
@@ -123,6 +141,188 @@ export default function register(sdk) {
     if (s < 90) return `${s} 秒前`
 
     return `${Math.round(s / 60)} 分钟前`
+  }
+
+  // ── Go 模型额度表（按模型计量的月度美元额度） ─────────────────────
+  const LIMIT_URL = 'https://opencode.ai/go'
+  const LIMIT_TTL = 6 * 3600_000 // 抓一次管 6 小时
+  const LIMIT_RETRY_MS = 10 * 60_000 // 抓失败 10 分钟后再试
+  const LIMIT_FILE = 'ocbal-go-limits.json'
+  const CAP_RATIO = { rolling: 0.2, weekly: 0.5, monthly: 1 }
+
+  /** 2026-10-31 官网 Go 档兜底值 —— 抓页面失败且无缓存时用，键为规范化模型名 */
+  const LIMIT_FALLBACK = {
+    deepseekv41flash: 100,
+    deepseekv4pro: 15,
+    glm53flash: 60,
+    glm53: 15,
+    glm52: 60,
+    kimik31pro: 15,
+    kimik3: 15,
+    kimik27code: 60,
+    minimaxm3: 60,
+    minimaxm31flash: 20,
+    qwen38max: 15,
+    qwen38flash: 30,
+    qwen37plus: 60,
+    mimov26flash: 60,
+    gpt6luna: 15,
+    claudehaiku55: 15,
+    gemini4argon: 30,
+    longcat20: 60
+  }
+
+  /** 规范化：'DeepSeek V4.1 Flash' 与 'deepseek-v4.1-flash' 落到同一个键 */
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+
+  /**
+   * 从 opencode.ai/go 的额度表解析 { 规范化模型名: {name, go, plus} }。
+   * 每行有两个 data-slot="number" 单元格：第一个是估算请求数（无 $），
+   * 第二个是月度额度（$100 / $200）。只认带 $ 的数字。
+   */
+  function parseGoLimits(html) {
+    const out = {}
+    const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/g
+    let m
+
+    while ((m = rowRe.exec(html))) {
+      const row = m[1]
+      const name = /<bdi>([^<]{1,60})<\/bdi>/.exec(row)
+
+      if (!name) continue
+
+      const nums = [...row.matchAll(/\$(\d+(?:\.\d+)?)/g)].map((x) => Number(x[1]))
+
+      if (!nums.length) continue // Unlimited / 免费行没有美元额度
+
+      out[norm(name[1])] = { name: name[1].trim(), go: nums[0], plus: nums[1] }
+    }
+
+    return out
+  }
+
+  /**
+   * 当前模型 → 月限（美元）：精确匹配表 → 兜底表 → 唯一包含匹配（防 glm53 误命中 glm53flash）。
+   * 匹配不到就返回 null，由调用方回落到服务端池口径。
+   */
+  function capOf(limits, modelId) {
+    const key = norm(modelId)
+
+    if (!key) return null
+    if (limits && limits[key] && limits[key].go) return limits[key].go
+    if (LIMIT_FALLBACK[key]) return LIMIT_FALLBACK[key]
+
+    const cands = Object.keys(limits || {}).filter((k) => k.includes(key) || key.includes(k))
+
+    if (cands.length === 1 && key.length >= 8) return limits[cands[0]].go
+
+    return null
+  }
+
+  /** node 环境才有 fs：拿 ~/.hermes 目录句柄 */
+  async function nodeEnv() {
+    if (typeof process === 'undefined' || !process.versions || !process.versions.node) return null
+
+    try {
+      const fs = await import('node:fs')
+      const os = await import('node:os')
+      const path = await import('node:path')
+
+      return {
+        fs,
+        path,
+        home: (process.env && process.env.HERMES_HOME) || path.join(os.homedir(), '.hermes')
+      }
+    } catch {
+      return null
+    }
+  }
+
+  let limitsMem = null
+
+  async function getLimits() {
+    if (limitsMem && Date.now() - limitsMem.at < (limitsMem.ok ? LIMIT_TTL : LIMIT_RETRY_MS)) {
+      return limitsMem.data
+    }
+
+    const env = await nodeEnv()
+
+    if (env) {
+      try {
+        const raw = JSON.parse(env.fs.readFileSync(env.path.join(env.home, 'cache', LIMIT_FILE), 'utf8'))
+
+        if (raw && raw.at && raw.data && Date.now() - raw.at < LIMIT_TTL) {
+          limitsMem = { at: raw.at, data: raw.data, ok: true }
+
+          return raw.data
+        }
+      } catch {
+        /* 没有缓存就现场抓 */
+      }
+    }
+
+    try {
+      const html = await getText(LIMIT_URL)
+      const data = parseGoLimits(html)
+
+      if (Object.keys(data).length >= 5) {
+        limitsMem = { at: Date.now(), data, ok: true }
+
+        if (env) {
+          try {
+            const dir = env.path.join(env.home, 'cache')
+
+            env.fs.mkdirSync(dir, { recursive: true })
+            env.fs.writeFileSync(env.path.join(dir, LIMIT_FILE), JSON.stringify({ at: Date.now(), data }))
+          } catch {
+            /* 只读环境也能跑 */
+          }
+        }
+
+        return data
+      }
+    } catch {
+      /* 抓不到 → 退回兜底表 */
+    }
+
+    limitsMem = { at: Date.now(), data: limitsMem ? limitsMem.data : {}, ok: false }
+
+    return limitsMem.data
+  }
+
+  let modelMem = null
+
+  /** 当前主模型：~/.hermes/config.yaml 的 model.default（provider 需为 opencode-go*） */
+  async function readModel() {
+    if (modelMem && Date.now() - modelMem.at < 5 * 60_000) return modelMem
+
+    let model = (typeof process !== 'undefined' && process.env && process.env.HERMES_MODEL) || ''
+    let provider = ''
+
+    const env = await nodeEnv()
+
+    if (env && !model) {
+      try {
+        const raw = env.fs.readFileSync(env.path.join(env.home, 'config.yaml'), 'utf8')
+        const block = /^model:[ \t]*\n((?:[ \t]+\S.*\n?)+)/m.exec(raw)
+
+        if (block) {
+          const d = /^[ \t]+default:[ \t]*['"]?([^'"\n#]+)['"]?/m.exec(block[1])
+
+          if (d) model = d[1].trim()
+
+          const p = /^[ \t]+provider:[ \t]*['"]?([^'"\n#]+)['"]?/m.exec(block[1])
+
+          if (p) provider = p[1].trim()
+        }
+      } catch {
+        /* 读不到就当未知模型：回落到服务端池口径 */
+      }
+    }
+
+    modelMem = { at: Date.now(), model, provider }
+
+    return modelMem
   }
 
   // ── 组件 ────────────────────────────────────────────────────────
@@ -154,7 +354,7 @@ export default function register(sdk) {
     )
   }
 
-  /** 一行一个窗口：标签 · 进度条 · 百分比 · 剩余额度 · 重置倒计时 */
+  /** 一行一个窗口：标签 · 进度条 · 百分比 · 剩余/上限 · 重置倒计时 */
   function Meter({ label, pct, remain, reset, t }) {
     return h(
       Box,
@@ -169,7 +369,7 @@ export default function register(sdk) {
         Box,
         { flexDirection: 'row' },
         h(Text, { color: t.color.text }, fit(remain, REMAIN_W)),
-        h(Text, { color: t.color.border, dimColor: true }, ' · '),
+        h(Text, null, ' '),
         h(Text, { color: t.color.muted }, lpad(clip(reset, ETA_W), ETA_W))
       )
     )
@@ -227,13 +427,13 @@ export default function register(sdk) {
   }
 
   /** 圆角卡片：标题嵌在顶边上，边框色随状态变化。 */
-  function Card({ border, children, t }) {
+  function Card({ border, children, t, title = TITLE }) {
     return h(
       Box,
       {
         borderColor: border,
         borderStyle: 'round',
-        borderText: { align: 'center', content: TITLE, position: 'top' },
+        borderText: { align: 'center', content: title, position: 'top' },
         flexDirection: 'column',
         opaque: true,
         paddingX: 2,
@@ -260,30 +460,24 @@ export default function register(sdk) {
           if (!zenKey && !goKey) throw new Error('未找到 OPENCODE_ZEN_API_KEY / OPENCODE_GO_API_KEY')
 
           const authKey = goKey || zenKey
-          const [go, zen] = await Promise.all([
+          const [go, zen, usage, limits, mine] = await Promise.all([
             getJson('https://opencode.ai/console/api/go/status', authKey).catch(() => null),
-            getJson('https://opencode.ai/console/api/billing/status', zenKey || authKey).catch(() => null)
+            getJson('https://opencode.ai/console/api/billing/status', zenKey || authKey).catch(() => null),
+            getJson('https://opencode.ai/zen/go/v1/usage', authKey).catch(() => null),
+            getLimits(),
+            readModel()
           ])
-
-          let usage = null
-
-          if (!go) usage = await getJson('https://opencode.ai/zen/go/v1/usage', authKey).catch(() => null)
 
           if (!alive) return
 
-          // 两个接口全挂才算“读不到”——只挂一个仍按有数据渲染。
+          // 额度接口全挂才算“读不到”——只挂一个仍按有数据渲染。
           if (go || usage || zen) {
-            setSnap({ at: Date.now(), go, usage, zen })
+            setSnap({ at: Date.now(), go, limits, mine, usage, zen })
             setErr(null)
 
-            const meters = go && go.access && go.access.meters ? go.access.meters : null
-            const rolling = meters && meters.fiveHour
+            const pct = usage && usage.usage && usage.usage.rolling ? Number(usage.usage.rolling.percent) : null
 
-            if (rolling) {
-              const pct = pctOf(rolling.usedMicroCents, rolling.limitMicroCents)
-
-              setHist((prev) => [...prev, pct].slice(-HIST_MAX))
-            }
+            if (Number.isFinite(pct)) setHist((prev) => [...prev, pct].slice(-HIST_MAX))
           } else {
             setErr('OpenCode 接口无响应')
           }
@@ -333,38 +527,42 @@ export default function register(sdk) {
       )
     }
 
-    const { go, usage, zen, at } = snap
+    const { go, limits, mine, usage, zen, at } = snap
     const meters = go && go.access && go.access.meters ? go.access.meters : null
     const u = usage && usage.usage ? usage.usage : null
+
+    // Go 现在是「按模型计量」：provider 是 opencode-go 时用当前模型的月限换算美元
+    const onGo = !mine.provider || mine.provider.startsWith('opencode-go')
+    const modelCap = onGo && mine.model ? capOf(limits, mine.model) : null
     const rows = []
 
-    for (const [label, id, m, fallback] of [
+    for (const [label, id, m, fb] of [
       ['5h', 'rolling', meters && meters.fiveHour, u && u.rolling],
       ['周', 'weekly', meters && meters.week, u && u.weekly],
       ['月', 'monthly', meters && meters.month, u && u.monthly]
     ]) {
-      if (m) {
-        const pct = pctOf(m.usedMicroCents, m.limitMicroCents) || (fallback ? Number(fallback.percent) || 0 : 0)
+      if (!m && !fb) continue
+
+      // 百分比以 usage 接口为准：它才是服务端按当前额度算出的真实占用
+      const pct = fb ? Number(fb.percent) || 0 : pctOf(m.usedMicroCents, m.limitMicroCents)
+      const cap = modelCap ? modelCap * (CAP_RATIO[id] || 1) : null
+      const reset = eta((m && m.resetsAt) || (fb && fb.resetsAt))
+      const idle = id === 'rolling' && m && !m.startsAt && !Number(m.usedMicroCents)
+      let remain
+
+      if (idle) {
+        remain = '空闲'
+      } else if (cap) {
+        remain = `剩 ${money(cap * (1 - pct / 100))}/${money(cap)}`
+      } else if (m) {
         const left = Number(m.limitMicroCents) - Number(m.usedMicroCents)
-        const idle = id === 'rolling' && !m.startsAt && !m.usedMicroCents
-        const remain = idle ? '空闲' : Number.isFinite(left) && Number(m.limitMicroCents) > 0 ? `剩 ${usdShort(left)}` : '—'
-        const reset = eta(m.resetsAt)
 
-        rows.push(h(Meter, { key: id, label, pct, remain, reset: reset ? `${reset} 后` : '', t }))
-      } else if (fallback) {
-        const reset = eta(fallback.resetsAt)
-
-        rows.push(
-          h(Meter, {
-            key: id,
-            label,
-            pct: Number(fallback.percent) || 0,
-            remain: '—',
-            reset: reset ? `${reset} 后` : '',
-            t
-          })
-        )
+        remain = Number.isFinite(left) && Number(m.limitMicroCents) > 0 ? `剩 ${usdShort(left)}` : '—'
+      } else {
+        remain = '剩 —'
       }
+
+      rows.push(h(Meter, { key: id, label, pct, remain, reset: reset ? `${reset} 后` : '', t }))
     }
 
     if (!rows.length) {
@@ -374,9 +572,19 @@ export default function register(sdk) {
     const stale = Boolean(err)
     const dotColor = stale ? t.color.error : Date.now() - at > 180_000 ? t.color.statusWarn : t.color.statusGood
 
+    // 标题带模型名：额度是按「这个模型的月限」换算的，必须让用户看见是哪个模型
+    const title = modelCap ? ` ⚡ Go · ${clip(mine.model, 30)} ` : TITLE
+    const mode = stale
+      ? `上次成功 ${ago(at)}`
+      : zen
+        ? zen.billingMode === 'prepaid'
+          ? '预付 · <$5 自动充 $20'
+          : '按量计费'
+        : ''
+
     return h(
       Card,
-      { border: t.color.border, t },
+      { border: t.color.border, t, title },
       rows[0],
       rows[1] || null,
       rows[2] || null,
@@ -385,13 +593,7 @@ export default function register(sdk) {
         bal: zen && zen.balanceMicroCents != null ? zen.balanceMicroCents : null,
         dotColor,
         dotText: stale ? '读取失败' : ago(at),
-        mode: stale
-          ? `上次成功 ${ago(at)}`
-          : zen
-            ? zen.billingMode === 'prepaid'
-              ? '预付 · <$5 自动充 $20'
-              : '按量计费'
-            : '',
+        mode,
         modeColor: stale ? t.color.statusWarn : undefined,
         t
       })
@@ -455,8 +657,29 @@ export default function register(sdk) {
     }
   }
 
+  async function getText(url) {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
+
+    try {
+      const res = await fetch(url, {
+        headers: {
+          accept: 'text/html',
+          'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) opencode-balance-widget/3.0'
+        },
+        signal: ctl.signal
+      })
+
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${url.replace(/^https:\/\//, '')}`)
+
+      return await res.text()
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   const app = defineWidgetApp({
-    help: 'OpenCode Go 额度 + Zen 钱包余额（60s 自动刷新）',
+    help: 'OpenCode Go 额度（按模型月限换算）+ Zen 钱包余额（60s 自动刷新）',
     id: 'ocbal',
     mode: 'ambient',
 

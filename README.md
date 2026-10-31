@@ -6,7 +6,7 @@
 
 ## 功能
 
-- **三窗口用量**：5h / 周 / 月，各一行 —— 细线进度条（主题色分段：50% / 80% / 95% 变色）+ 百分比 + 剩余额度 + 重置倒计时
+- **三窗口用量**：5h / 周 / 月，各一行 —— 细线进度条（主题色分段：50% / 80% / 95% 变色）+ 百分比 + **剩余/上限** + 重置倒计时
 - **走势图**：分隔线上内嵌本会话 5h 用量 sparkline（金色调）
 - **钱包行**：Zen 预付钱包余额（低于 $5 标红）· 计费方式 · 右上角数据新鲜度指示灯（绿 → 黄 >3 分钟 → 红：读取失败，失败时保留上次成功数据并显示「上次成功 N 分钟前」）
 - 60 秒自动刷新，15 秒时钟重绘（倒计时跳动）
@@ -18,18 +18,18 @@
 <summary>文本示意（无图环境）</summary>
 
 ```
-╭─────────── ⚡ OpenCode 额度 ───────────╮
-│ 5h  ━┄┄┄┄┄┄┄┄┄┄┄  12%  剩 $2.85 · 2h14m 后 │
-│ 周  ━━━┄┄┄┄┄┄┄┄┄┄  31%  剩 $320 · 3天 后    │
-│ 月  ━━━━━━┄┄┄┄┄┄┄  58%  剩 $18 · 12天 后    │
-│ ┄┄┄▂▃▅▆▇┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  5h            │
-│ 余额 $42.00 · 预付 · <$5 自动充 $20  ● 刚刚 │
-╰────────────────────────────────────────╯
+╭            ⚡ Go · deepseek-v4.1-flash            ╮
+│  5h  ━━┄┄┄┄┄┄┄┄┄   19%  剩 $16/$20     2h58m 后  │
+│  周  ━━━━━━━┄┄┄┄   64%  剩 $18/$50       1天 后  │
+│  月  ━━━━━━━╸┄┄┄   69%  剩 $31/$100     16天 后  │
+│  ┄┄┄┄┄┄┄▂▃▅▆▇┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │
+│  余额 $16.43 · 预付 · <$5 自动充 $20     ● 刚刚  │
+╰──────────────────────────────────────────────────╯
 ```
 
 </details>
 
-> 预览图由挂件的无 TUI 预览器渲染，数据为示例值。
+> 上面的卡片由 `scripts/preview.mjs`（无 TUI 预览器）渲染真实接口数据得到；`docs/preview.png` 是 v2 时期的截图。
 
 ## 环境要求
 
@@ -77,11 +77,26 @@ rm ~/.hermes/tui-widgets/opencode-balance.mjs
 
 | 接口 | 用途 |
 |------|------|
-| `GET https://opencode.ai/console/api/go/status` | Go 订阅 5h / 周 / 月 三窗口（meters.access.meters） |
+| `GET https://opencode.ai/zen/go/v1/usage` | **三窗口百分比（权威）**：rolling / weekly / monthly 的 percent 与 resetsAt |
+| `GET https://opencode.ai/console/api/go/status` | Go 订阅窗口起止、meters 美元（旧账户池口径，仅作回退） |
 | `GET https://opencode.ai/console/api/billing/status` | Zen 预付钱包余额（balanceMicroCents，单位为万分之一美分，除以 1e8 得美元） |
-| `GET https://opencode.ai/zen/go/v1/usage` | 备用：go/status 失败时取三窗口百分比 |
+| `GET https://opencode.ai/go` | 各模型 Go / Go Plus **月度额度表**（6 小时缓存到 `~/.hermes/cache/ocbal-go-limits.json`） |
 
 均带 `Authorization: Bearer <key>` 请求头，10 秒超时。密钥读取顺序：`process.env` → `~/.hermes/.env`（支持 `HERMES_HOME` 覆盖路径）。
+
+## 额度口径（v3 起）
+
+2026-10 起 Go 改成**按模型计量**：每个模型有自己的月度美元额度（如 DeepSeek V4.1 Flash = $100/月，Go Plus = $200），
+三个窗口是月限的比例：**5h = 20%、周 = 50%、月 = 100%**。
+
+问题在于 `console/api/go/status` 的 `meters` 美元仍是旧的 $60 账户池口径（DeepSeek 会显示「剩 $10.17」这种明显偏小的数），
+**百分比才是真实占用**。所以挂件：
+
+- 百分比取 `zen/go/v1/usage`（服务端权威值）；
+- 美元按「当前模型月限 × 窗口比例」换算，行的格式为 `剩 $16/$20`；
+- 卡片标题显示当前模型（`⚡ Go · deepseek-v4.1-flash`），当前模型读 `~/.hermes/config.yaml` 的 `model.default`
+  （`HERMES_MODEL` 可临时覆盖，用于预览别的模型额度）；
+- 模型月限来自官网表格，抓不到时用内置兜底表；两者都不命中（未知模型）则回退成服务端池口径的 `剩 $x.xx`。
 
 ## 定制
 
@@ -92,27 +107,34 @@ rm ~/.hermes/tui-widgets/opencode-balance.mjs
 | `REFRESH_MS` | 60000 | 拉取间隔 |
 | `TICK_MS` | 15000 | 时钟重绘（倒计时跳动） |
 | `WIDTH` | 52 | 卡片总宽（含边框与内边距） |
-| `TITLE` | ` ⚡ OpenCode 额度 ` | 边框内嵌标题 |
+| `BAR_W` | 11 | 进度条列宽 |
+| `REMAIN_W` | 14 | 「剩 $x/$y」列宽（最宽为 `剩 $2.43/$3.00`） |
+| `LIMIT_TTL` | 21600000 | 模型额度表缓存时长（6h） |
+| `TITLE` | ` ⚡ OpenCode 额度 ` | 无模型额度时的边框内嵌标题 |
 
 ## 故障排查
 
 - **显示「额度读取失败」**：先验证 key —— `curl -H "Authorization: Bearer $OPENCODE_GO_API_KEY" https://opencode.ai/console/api/go/status`；HTTP 4xx 换 key，5xx 等 OpenCode 恢复
 - **挂件没出现**：确认用的是 `hermes --tui`；`/widgets-reload` 看输出里 `loaded:` 是否列出本文件；仍不出看 `~/.hermes/logs/tui_gateway_crash.log`
 - **只显示「Go 订阅额度不可用」**：非 Go 订阅账号的正常表现，钱包余额仍会显示
+- **剩余美元看着比官网小**：说明模型月限没查到（标题里没有模型名），检查 `~/.hermes/cache/ocbal-go-limits.json` 是否生成；删掉它会在下次刷新时重抓
 - **卡片变形/换行**：改过 `WIDTH` 后行宽会重新计算，若手改了行内列宽，注意每行动态字符串都过 `fit()`/`clip()`，别让任何一行超过 `INNER = WIDTH - 6`
 
 ## 兼容性说明
 
 依赖 Hermes widget SDK 的 `defineWidgetApp / openWidget / Box / Text / ShimmerRows / sparkline`。上游接口字段变动时，挂件会显示错误提示而非崩溃；widget SDK 是非公开契约，Hermes 大版本升级后如失效请回来更新本包。
 
+实测环境：Hermes v0.22.5（2026-10-31）。
+
 ## 文件清单
 
 | 文件 | 说明 |
 |------|------|
 | `opencode-balance.mjs` | 挂件本体（ESM 单文件，id=`ocbal`） |
+| `scripts/preview.mjs` | 无 TUI 预览器：渲染挂件真实代码路径并打印卡片（`node scripts/preview.mjs`） |
 | `install.sh` | 安装脚本（自动备份旧文件、检查 key 配置） |
 | `LICENSE` | MIT |
 | `README.md` | 本文件 |
-| `docs/preview.png` | 预览图（示例数据） |
+| `docs/preview.png` | 预览图（v2 示例数据，版式以文本示意为准） |
 
-版本：v2（2026-10-18），作者 raven，MIT 许可。
+版本：v3（2026-10-31，Go 按模型额度换算），作者 raven，MIT 许可。
