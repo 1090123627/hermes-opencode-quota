@@ -94,9 +94,17 @@ rm ~/.hermes/tui-widgets/opencode-balance.mjs
 
 - 百分比取 `zen/go/v1/usage`（服务端权威值）；
 - 美元按「当前模型月限 × 窗口比例」换算，行的格式为 `剩 $16/$20`；
-- 卡片标题显示当前模型（`⚡ Go · deepseek-v4.1-flash`），当前模型读 `~/.hermes/config.yaml` 的 `model.default`
-  （`HERMES_MODEL` 可临时覆盖，用于预览别的模型额度）；
+- 卡片标题显示当前模型（`⚡ Go · deepseek-v4.1-flash`）。当前模型的判定顺序：
+  1. `HERMES_INFERENCE_MODEL` / `HERMES_MODEL` 环境变量（临时覆盖，也能用来预览别的模型额度）
+  2. `~/.hermes/state.db` 里最近活跃会话的 model —— TUI 的 `/model` 切换是**会话级**的，只写这里，
+     不写 config.yaml 也不写进程 env（见 `tui_gateway/model_switch.py`），所以必须读库才能跟上
+  3. `~/.hermes/config.yaml` 的 `model.default`（老版本 / 无 state.db 时）
+- 模型列表每 60 秒随刷新重读一次，所以 `/model` 切换后最多 1 分钟就跟随；
 - 模型月限来自官网表格，抓不到时用内置兜底表；两者都不命中（未知模型）则回退成服务端池口径的 `剩 $x.xx`。
+
+**精度说明**：`zen/go/v1/usage` 的 percent 是**账户级综合百分比**（Go 把各模型额度按扣费归一成一个池），
+不是按模型分开计的两个数。所以美元数字是「按当前模型月限换算的等价额度」——只用一个模型时准确，
+混用多个模型时是近似值。同时开多个 live 会话时，取最近活动的那个会话的模型，不一定是你正在看的窗口。
 
 ## 定制
 
