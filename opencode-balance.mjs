@@ -292,18 +292,55 @@ export default function register(sdk) {
 
   let modelMem = null
 
-  /** 当前主模型：~/.hermes/config.yaml 的 model.default（provider 需为 opencode-go*） */
-  async function readModel() {
-    if (modelMem && Date.now() - modelMem.at < 5 * 60_000) return modelMem
+  /**
+   * 当前会话模型：TUI 里 `/model` 切换是会话级的，只写 state.db、不碰 config.yaml，
+   * 也不写 process env（tui_gateway/model_switch.py 里明确不写 HERMES_MODEL）。
+   * 所以顺序是：env 覆盖 → state.db 最近活跃会话 → config.yaml 的 model 段。
+   */
+  async function liveSessionModel(env) {
+    try {
+      const { DatabaseSync } = await import('node:sqlite')
+      const db = new DatabaseSync(env.path.join(env.home, 'state.db'), { readOnly: true })
 
-    let model = (typeof process !== 'undefined' && process.env && process.env.HERMES_MODEL) || ''
+      try {
+        const row = db
+          .prepare(
+            'select model, billing_provider from sessions where ended_at is null and model is not null order by last_activity_at desc limit 1'
+          )
+          .get()
+
+        if (!row || !row.model) return null
+
+        return { model: String(row.model), provider: String(row.billing_provider || '') }
+      } finally {
+        db.close()
+      }
+    } catch {
+      return null // node < 22 / 非 node 运行时 / 库被锁：交给 config.yaml
+    }
+  }
+
+  async function readModel() {
+    if (modelMem && Date.now() - modelMem.at < REFRESH_MS) return modelMem
+
+    const env = typeof process !== 'undefined' && process.env ? process.env : {}
+    let model = String(env.HERMES_INFERENCE_MODEL || env.HERMES_MODEL || '').trim()
     let provider = ''
 
-    const env = await nodeEnv()
+    const io = await nodeEnv()
 
-    if (env && !model) {
+    if (io && !model) {
+      const live = await liveSessionModel(io)
+
+      if (live) {
+        model = live.model
+        provider = live.provider
+      }
+    }
+
+    if (io && !model) {
       try {
-        const raw = env.fs.readFileSync(env.path.join(env.home, 'config.yaml'), 'utf8')
+        const raw = io.fs.readFileSync(io.path.join(io.home, 'config.yaml'), 'utf8')
         const block = /^model:[ \t]*\n((?:[ \t]+\S.*\n?)+)/m.exec(raw)
 
         if (block) {
