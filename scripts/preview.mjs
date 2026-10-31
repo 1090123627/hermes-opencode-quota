@@ -123,6 +123,14 @@ const THEME = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// --no-limits：模拟额度表抓取失败（验证内置兜底表与「额度表离线」标记）
+if (process.argv.includes('--no-limits')) {
+  const real = globalThis.fetch
+
+  globalThis.fetch = (url, opts) =>
+    String(url).endsWith('/go') ? Promise.resolve(new Response('', { status: 503 })) : real(url, opts)
+}
+
 const mod = await import(file)
 mod.default(sdk)
 

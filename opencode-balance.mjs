@@ -146,7 +146,7 @@ export default function register(sdk) {
 
   // ── Go 模型额度表（按模型计量的月度美元额度） ─────────────────────
   const LIMIT_URL = 'https://opencode.ai/go'
-  const LIMIT_TTL = 6 * 3600_000 // 抓一次管 6 小时
+  const LIMIT_TTL = 3600_000 // 抓一次管 1 小时：官网调额度后 1h 内自动跟上，无需改代码
   const LIMIT_RETRY_MS = 10 * 60_000 // 抓失败 10 分钟后再试
   const LIMIT_FILE = 'ocbal-go-limits.json'
   const CAP_RATIO = { rolling: 0.2, weekly: 0.5, monthly: 1 }
@@ -206,16 +206,17 @@ export default function register(sdk) {
    * 当前模型 → 月限（美元）：精确匹配表 → 兜底表 → 唯一包含匹配（防 glm53 误命中 glm53flash）。
    * 匹配不到就返回 null，由调用方回落到服务端池口径。
    */
-  function capOf(limits, modelId) {
+  function capOf(limits, modelId, tier = 'go') {
     const key = norm(modelId)
+    const pick = (row) => (row && (row[tier] || row.go)) || null
 
     if (!key) return null
-    if (limits && limits[key] && limits[key].go) return limits[key].go
-    if (LIMIT_FALLBACK[key]) return LIMIT_FALLBACK[key]
+    if (pick(limits && limits[key])) return pick(limits[key])
+    if (tier === 'go' && LIMIT_FALLBACK[key]) return LIMIT_FALLBACK[key]
 
     const cands = Object.keys(limits || {}).filter((k) => k.includes(key) || key.includes(k))
 
-    if (cands.length === 1 && key.length >= 8) return limits[cands[0]].go
+    if (cands.length === 1 && key.length >= 8) return pick(limits[cands[0]])
 
     return null
   }
@@ -243,7 +244,7 @@ export default function register(sdk) {
 
   async function getLimits() {
     if (limitsMem && Date.now() - limitsMem.at < (limitsMem.ok ? LIMIT_TTL : LIMIT_RETRY_MS)) {
-      return limitsMem.data
+      return { data: limitsMem.data, origin: limitsMem.ok ? 'cache' : 'builtin' }
     }
 
     const env = await nodeEnv()
@@ -255,7 +256,7 @@ export default function register(sdk) {
         if (raw && raw.at && raw.data && Date.now() - raw.at < LIMIT_TTL) {
           limitsMem = { at: raw.at, data: raw.data, ok: true }
 
-          return raw.data
+          return { data: raw.data, origin: 'cache' }
         }
       } catch {
         /* 没有缓存就现场抓 */
@@ -280,7 +281,7 @@ export default function register(sdk) {
           }
         }
 
-        return data
+        return { data, origin: 'net' }
       }
     } catch {
       /* 抓不到 → 退回兜底表 */
@@ -288,7 +289,7 @@ export default function register(sdk) {
 
     limitsMem = { at: Date.now(), data: limitsMem ? limitsMem.data : {}, ok: false }
 
-    return limitsMem.data
+    return { data: limitsMem.data, origin: 'builtin' }
   }
 
   let modelMem = null
@@ -594,6 +595,8 @@ export default function register(sdk) {
     }
 
     const { go, limits, mine: auto, usage, zen, at } = snap
+    const limitRows = limits && limits.data ? limits.data : limits || {}
+    const limitOrigin = (limits && limits.origin) || 'builtin'
     const meters = go && go.access && go.access.meters ? go.access.meters : null
     const u = usage && usage.usage ? usage.usage : null
 
@@ -602,7 +605,9 @@ export default function register(sdk) {
     // 多窗口时可能不是当前这个窗口的模型
     const mine = lock ? { model: lock, provider: '', source: 'lock' } : auto
     const onGo = lock ? true : !mine.provider || mine.provider.startsWith('opencode-go')
-    const modelCap = mine.model ? (onGo ? capOf(limits, mine.model) : null) : null
+    // Go Plus / Teams 的额度是 go 页面的第二列（Go 列约等于它的一半）
+    const tier = /plus|team/.test(String((go && go.product) || '').toLowerCase()) ? 'plus' : 'go'
+    const modelCap = mine.model && onGo ? capOf(limitRows, mine.model, tier) : null
     const rows = []
 
     for (const [label, id, m, fb] of [
@@ -647,11 +652,13 @@ export default function register(sdk) {
       : TITLE
     const mode = stale
       ? `上次成功 ${ago(at)}`
-      : zen
-        ? zen.billingMode === 'prepaid'
-          ? '预付 · <$5 自动充 $20'
-          : '按量计费'
-        : ''
+      : limitOrigin === 'builtin' && modelCap
+        ? '额度表离线 · 内置值'
+        : zen
+          ? zen.billingMode === 'prepaid'
+            ? '预付 · <$5 自动充 $20'
+            : '按量计费'
+          : ''
 
     return h(
       Card,
